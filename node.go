@@ -81,75 +81,107 @@ func (n *ReliableCausalBroadcastNode) DeliveredMessages() []hive.Message {
 // mutually parallel events.
 type Orderer struct{}
 
+func happensBefore(va, vb map[string]int) bool {
+	strict := false
+	for k := range va {
+		if va[k] > vb[k] {
+			return false
+		}
+		if va[k] < vb[k] {
+			strict = true
+		}
+	}
+	for k, b := range vb {
+		if va[k] > b {
+			return false
+		}
+		if va[k] < b {
+			strict = true
+		}
+	}
+	return strict
+}
+
+func topoSortByPayload(ids []string, less func(i, j int) bool) []string {
+	n := len(ids)
+	adj := make([][]int, n)
+	indeg := make([]int, n)
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			if i != j && less(i, j) {
+				adj[i] = append(adj[i], j)
+				indeg[j]++
+			}
+		}
+	}
+	avail := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		if indeg[i] == 0 {
+			avail = append(avail, i)
+		}
+	}
+	sort.Slice(avail, func(i, j int) bool { return ids[avail[i]] < ids[avail[j]] })
+	var out []string
+	for len(avail) > 0 {
+		cur := avail[0]
+		avail = avail[1:]
+		out = append(out, ids[cur])
+		for _, to := range adj[cur] {
+			indeg[to]--
+			if indeg[to] == 0 {
+				avail = append(avail, to)
+			}
+		}
+		sort.Slice(avail, func(i, j int) bool { return ids[avail[i]] < ids[avail[j]] })
+	}
+	return out
+}
+
 func (o *Orderer) Order(msgs ...hive.Message) (ordered []string, parallel [][]string) {
 	if len(msgs) == 0 {
 		return nil, nil
 	}
-
-	type event struct {
-		payload string
-		clock   map[string]int
+	ids := make([]string, len(msgs))
+	idToIdx := make(map[string]int, len(msgs))
+	vcs := make([]map[string]int, len(msgs))
+	for i, m := range msgs {
+		ids[i] = fmt.Sprint(m.Payload)
+		idToIdx[ids[i]] = i
+		vcs[i] = copyClock(vectorClockFromMetadata(m.Metadata))
 	}
-	events := make([]event, 0, len(msgs))
-	for _, m := range msgs {
-		events = append(events, event{
-			payload: fmt.Sprint(m.Payload),
-			clock:   extractClock(m.Metadata),
-		})
-	}
+	less := func(i, j int) bool { return happensBefore(vcs[i], vcs[j]) }
+	parallelPred := func(i, j int) bool { return !less(i, j) && !less(j, i) }
 
-	adj := make([][]int, len(events))
-	indeg := make([]int, len(events))
-	for i := 0; i < len(events); i++ {
-		for j := i + 1; j < len(events); j++ {
-			aBeforeB := clockLTE(events[i].clock, events[j].clock) && !clockLTE(events[j].clock, events[i].clock)
-			bBeforeA := clockLTE(events[j].clock, events[i].clock) && !clockLTE(events[i].clock, events[j].clock)
-			if aBeforeB {
-				adj[i] = append(adj[i], j)
-				indeg[j]++
-			}
-			if bBeforeA {
-				adj[j] = append(adj[j], i)
-				indeg[i]++
-			}
+	ordered = topoSortByPayload(ids, less)
+
+	assigned := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if assigned[id] {
+			continue
 		}
-	}
-
-	available := make([]int, 0, len(events))
-	for i := range events {
-		if indeg[i] == 0 {
-			available = append(available, i)
-		}
-	}
-	sort.Slice(available, func(i, j int) bool {
-		return events[available[i]].payload < events[available[j]].payload
-	})
-
-	for len(available) > 0 {
-		cur := available[0]
-		available = available[1:]
-		ordered = append(ordered, events[cur].payload)
-		for _, to := range adj[cur] {
-			indeg[to]--
-			if indeg[to] == 0 {
-				available = append(available, to)
+		group := []string{id}
+		assigned[id] = true
+		for j := 0; j < len(ids); j++ {
+			if assigned[ids[j]] {
+				continue
+			}
+			ok := true
+			for _, gid := range group {
+				if !parallelPred(idToIdx[gid], j) {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				group = append(group, ids[j])
+				assigned[ids[j]] = true
 			}
 		}
-		sort.Slice(available, func(i, j int) bool {
-			return events[available[i]].payload < events[available[j]].payload
-		})
-	}
-
-	for i := 0; i < len(events); i++ {
-		for j := i + 1; j < len(events); j++ {
-			aBeforeB := clockLTE(events[i].clock, events[j].clock) && !clockLTE(events[j].clock, events[i].clock)
-			bBeforeA := clockLTE(events[j].clock, events[i].clock) && !clockLTE(events[i].clock, events[j].clock)
-			if !aBeforeB && !bBeforeA {
-				parallel = append(parallel, []string{events[i].payload, events[j].payload})
-			}
+		if len(group) > 1 {
+			sort.Strings(group)
+			parallel = append(parallel, group)
 		}
 	}
-
 	return ordered, parallel
 }
 
@@ -236,7 +268,10 @@ func copyClock(in map[string]int) map[string]int {
 	return out
 }
 
-func extractClock(metadata map[string]any) map[string]int {
+func vectorClockFromMetadata(metadata map[string]any) map[string]int {
+	if metadata == nil {
+		return map[string]int{}
+	}
 	raw, ok := metadata["vector_clock"]
 	if !ok {
 		return map[string]int{}
@@ -246,13 +281,4 @@ func extractClock(metadata map[string]any) map[string]int {
 		return map[string]int{}
 	}
 	return clock
-}
-
-func clockLTE(a, b map[string]int) bool {
-	for k, av := range a {
-		if av > b[k] {
-			return false
-		}
-	}
-	return true
 }
